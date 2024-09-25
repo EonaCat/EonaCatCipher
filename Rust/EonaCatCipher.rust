@@ -1,0 +1,261 @@
+use rand::{RngCore, Rng};
+use sha2::{Sha256, Sha512, Digest};
+use hmac::{Hmac, Mac};
+use std::convert::TryInto;
+
+type HmacSha256 = Hmac<Sha256>;
+type HmacSha512 = Hmac<Sha512>;
+
+const DEFAULT_SALT_SIZE: usize = 256; // Salt size for key derivation
+const DEFAULT_IV_SIZE: usize = 256; // IV size (2048 bits)
+const DEFAULT_KEY_SIZE: usize = 256; // Key size (2048 bits)
+const DEFAULT_ROUNDS: usize = 256; // Rounds
+const DEFAULT_BLOCK_SIZE: usize = 1024; // 1kb
+const HMAC_KEY_SIZE: usize = 32; // Key size for HMAC (256 bits)
+
+/*
+ * EonaCatCipher - Because security is key!
+ * 
+ * Copyright (c) 2024 EonaCat (Jeroen Saey)
+ * 
+ * https://eonacat.com/license
+ * 
+ *   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION 
+ *                  OF SOFTWARE BY EONACAT (JEROEN SAEY)
+ *
+ * This software is provided "as is", without any express or implied warranty.
+ * In no event shall the authors or copyright holders be liable for any claim,
+ * damages or other liability, whether in an action of contract, tort or otherwise,
+ * arising from, out of or in connection with the software or the use or other
+ * dealings in the software.
+ * 
+ * You may use, copy, modify, merge, publish, distribute, sublicense, and/or sell 
+ * copies of the Software, and permit persons to whom the Software is furnished 
+ * to do so, subject to the following conditions:
+ * 
+ * 1. The above copyright notice and this permission notice shall be included in 
+ *    all copies or substantial portions of the Software.
+ * 
+ * 2. The software must not be used for any unlawful purpose.
+ * 
+ * For any inquiries, please contact: eonacat@gmail.com
+ */
+
+pub struct EonaCatCipher {
+    derived_key: Vec<u8>, // Derived encryption key
+    hmac_key: Vec<u8>,    // HMAC key
+    iv_size: usize,       // IV size
+    key_size: usize,      // Key size
+    rounds: usize,        // Number of rounds for key derivation
+    block_size: usize,    // The size of the block that is created
+}
+
+impl EonaCatCipher {
+    pub fn new(password: &str, salt_size: usize, iv_size: usize, key_size: usize, rounds: usize, block_size: usize) -> Result<Self, String> {
+        if password.is_empty() {
+            return Err("EonaCatCipher: Password cannot be null or empty.".to_string());
+        }
+
+        let (derived_key, hmac_key) = Self::derive_key_and_hmac(password, salt_size)?;
+
+        Ok(Self {
+            derived_key,
+            hmac_key,
+            iv_size,
+            key_size,
+            rounds,
+            block_size,
+        })
+    }
+
+    fn generate_random_bytes(size: usize) -> Vec<u8> {
+        let mut rng = rand::thread_rng();
+        let mut random_bytes = vec![0u8; size];
+        rng.fill_bytes(&mut random_bytes);
+        random_bytes
+    }
+
+    fn derive_key_and_hmac(password: &str, salt_size: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let salt = Self::generate_random_bytes(salt_size);
+        let encryption_key = Self::pbkdf2(password, &salt, DEFAULT_KEY_SIZE, DEFAULT_ROUNDS)?;
+        let hmac_key = Self::pbkdf2(password, &salt, HMAC_KEY_SIZE, DEFAULT_ROUNDS)?;
+
+        let mut key_with_salt = vec![0u8; salt.len() + encryption_key.len()];
+        key_with_salt[..salt.len()].copy_from_slice(&salt);
+        key_with_salt[salt.len()..].copy_from_slice(&encryption_key);
+
+        Ok((key_with_salt, hmac_key))
+    }
+
+    fn pbkdf2(password: &str, salt: &[u8], key_length: usize, iterations: usize) -> Result<Vec<u8>, String> {
+        let mut derived_key = vec![0u8; key_length];
+        let hmac = HmacSha512::new_varkey(password.as_bytes()).map_err(|e| e.to_string())?;
+        let hash_length = hmac.output_size();
+
+        let blocks_needed = (key_length + hash_length - 1) / hash_length;
+
+        for block_index in 0..blocks_needed {
+            let mut current_block = Vec::with_capacity(salt.len() + 4);
+            current_block.extend_from_slice(salt);
+            current_block.extend_from_slice(&(block_index + 1).to_be_bytes());
+
+            let mut u = hmac.clone().finalize_reset(&current_block);
+            let mut block = u.clone();
+
+            let derived_key_offset = block_index * hash_length;
+            let remaining = key_length - derived_key_offset;
+
+            let copy_length = remaining.min(hash_length);
+            derived_key[derived_key_offset..derived_key_offset + copy_length].copy_from_slice(&u);
+
+            for _ in 1..iterations {
+                u = hmac.clone().finalize_reset(&u);
+                for i in 0..hash_length {
+                    block[i] ^= u[i];
+                }
+                let remaining = key_length - derived_key_offset;
+
+                let copy_length = remaining.min(hash_length);
+                derived_key[derived_key_offset..derived_key_offset + copy_length].copy_from_slice(&block);
+            }
+        }
+
+        Ok(derived_key)
+    }
+
+    pub fn encrypt(&self, plaintext: &str) -> Vec<u8> {
+        let iv = Self::generate_random_bytes(self.iv_size);
+        let plaintext_bytes = plaintext.as_bytes();
+
+        let mut ciphertext = vec![0u8; plaintext_bytes.len()];
+
+        let mut cipher = EonaCatCrypto::new(&self.derived_key, &iv, self.block_size, self.rounds);
+        cipher.generate(plaintext_bytes, &mut ciphertext, true);
+
+        let mut result = Vec::with_capacity(self.iv_size + ciphertext.len());
+        result.extend_from_slice(&iv);
+        result.extend_from_slice(&ciphertext);
+
+        let hmac = self.generate_hmac(&result);
+        result.extend_from_slice(&hmac);
+        
+        result
+    }
+
+    pub fn decrypt(&self, ciphertext_with_hmac: &[u8]) -> Result<String, String> {
+        let hmac_offset = ciphertext_with_hmac.len() - HMAC_KEY_SIZE;
+
+        let provided_hmac = &ciphertext_with_hmac[hmac_offset..];
+        let ciphertext = &ciphertext_with_hmac[..hmac_offset];
+
+        let calculated_hmac = self.generate_hmac(ciphertext);
+        if provided_hmac != calculated_hmac.as_slice() {
+            return Err("EonaCatCipher: HMAC validation failed. Data may have been tampered with.".to_string());
+        }
+
+        let iv = &ciphertext[..self.iv_size];
+        let encrypted_data = &ciphertext[self.iv_size..];
+
+        let mut decrypted_data = vec![0u8; encrypted_data.len()];
+        let mut cipher = EonaCatCrypto::new(&self.derived_key, iv, self.block_size, self.rounds);
+        cipher.generate(encrypted_data, &mut decrypted_data, false);
+
+        String::from_utf8(decrypted_data).map_err(|e| e.to_string())
+    }
+
+    fn generate_hmac(&self, data: &[u8]) -> Vec<u8> {
+        let mut hmac = HmacSha256::new_varkey(&self.hmac_key).expect("HMAC key should be valid");
+        hmac.update(data);
+        hmac.finalize().into_bytes().to_vec()
+    }
+}
+
+pub struct EonaCatCrypto {
+    block_size: usize,
+    rounds: usize,
+    state: Vec<u64>,
+    key: Vec<u32>,
+    nonce: Vec<u32>,
+    block_counter: u32,
+}
+
+impl EonaCatCrypto {
+    pub fn new(key_with_salt: &[u8], nonce: &[u8], block_size: usize, rounds: usize) -> Self {
+        let key_length = key_with_salt.len() / 4;
+        let mut key = vec![0u32; key_length];
+        key.copy_from_slice(&key_with_salt[..key_length * 4].chunks(4).map(|chunk| {
+            u32::from_be_bytes(chunk.try_into().unwrap())
+        }).collect::<Vec<_>>());
+
+        let nonce_length = nonce.len() / 4;
+        let mut nonce_arr = vec![0u32; nonce_length];
+        nonce_arr.copy_from_slice(&nonce[..nonce_length * 4].chunks(4).map(|chunk| {
+            u32::from_be_bytes(chunk.try_into().unwrap())
+        }).collect::<Vec<_>>());
+
+        Self {
+            block_size,
+            rounds,
+            state: vec![0u64; block_size / 4],
+            key,
+            nonce: nonce_arr,
+            block_counter: 0,
+        }
+    }
+
+    fn generate_block(&mut self, output: &mut [u8]) {
+        for i in 0..self.state.len() {
+            self.state[i] = (self.key[i % self.key.len()] as u64 ^ self.nonce[i % self.nonce.len()] as u64) + (i as u64 * 0x5DEECE66D);
+        }
+
+        for round in 0..self.rounds {
+            for i in 0..self.state.len() {
+                self.state[i] = (((self.state[i] as i64) + round as i64) ^ ((round as i64) * 0x5DEECE66D as i64) + (i as i64 + self.block_counter as i64)) as u64);
+            }
+        }
+
+        output.copy_from_slice(bytemuck::cast_slice(&self.state));
+        self.block_counter += 1;
+    }
+
+    pub fn generate(&mut self, input: &[u8], output: &mut [u8], encrypt: bool) {
+        let total_blocks = (input.len() + self.block_size - 1) / self.block_size;
+
+        for block_index in 0..total_blocks {
+            let input_offset = block_index * self.block_size;
+            let output_offset = block_index * self.block_size;
+            let mut block = vec![0u8; self.block_size];
+
+            self.generate_block(&mut block);
+
+            for i in 0..block.len() {
+                if input_offset + i < input.len() {
+                    output[output_offset + i] = input[input_offset + i] ^ block[i];
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    let password = "securePassword123!@#$";
+    let plaintext = "Thank you for using EonaCatCipher!";
+
+    println!("Encrypting '{}' with password '{}' (we do this 5 times)", plaintext, password);
+    println!("================");
+
+    for i in 0..5 {
+        println!("Encryption round {}: ", i + 1);
+        println!("================");
+
+        let cipher = EonaCatCipher::new(password, DEFAULT_SALT_SIZE, DEFAULT_IV_SIZE, DEFAULT_KEY_SIZE, DEFAULT_ROUNDS, DEFAULT_BLOCK_SIZE)
+            .expect("Failed to create cipher");
+
+        let encrypted = cipher.encrypt(plaintext);
+        println!("Encrypted (byte array): {:?}", encrypted);
+
+        let decrypted = cipher.decrypt(&encrypted).expect("Failed to decrypt");
+        println!("Decrypted: {}", decrypted);
+        println!("================");
+    }
+}
